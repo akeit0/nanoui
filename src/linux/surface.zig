@@ -26,6 +26,7 @@ pub const Surface = struct {
     view: ui.View,
     instances: std.ArrayList(gpu.Instance) = .empty,
     pixels: []u8 = &.{},
+    raster_cache: raster.Cache,
     pixel_w: usize = 0,
     pixel_h: usize = 0,
     /// Instances changed since the pixels were drawn.
@@ -53,6 +54,7 @@ pub const Surface = struct {
         const area = g.gtk_drawing_area_new();
         self.* = .{
             .gpa = gpa,
+            .raster_cache = .init(gpa),
             .window = window,
             .area = area,
             .im = g.gtk_im_multicontext_new(),
@@ -82,6 +84,7 @@ pub const Surface = struct {
     }
 
     pub fn destroy(self: *Surface) void {
+        self.raster_cache.deinit();
         const g = &gtk.api;
         if (self.tick != 0) g.gtk_widget_remove_tick_callback(self.area, self.tick);
         if (self.idle != 0) _ = g.g_source_remove(self.idle);
@@ -159,7 +162,7 @@ pub const Surface = struct {
             self.pixel_w = w;
             self.pixel_h = h;
         }
-        raster.draw(.{ .bytes = self.pixels, .width = w, .height = h }, self.instances.items, self.text.atlas.mask(), self.text.images.pictures(), self.scale, self.ctx.theme.background);
+        raster.drawCached(.{ .bytes = self.pixels, .width = w, .height = h }, self.instances.items, self.text.atlas.mask(), self.text.images.pictures(), self.scale, self.ctx.theme.background, &self.raster_cache);
         self.stale = false;
     }
 
@@ -346,7 +349,7 @@ fn keyOf(keyval: c_uint) ?ctx_mod.Key {
         0xff1b => .escape,
         0xff55 => .page_up,
         0xff56 => .page_down,
-        0xffbe...0xffc9 => @enumFromInt(@intFromEnum(ctx_mod.Key.f1) + (keyval - 0xffbe)),
+        0xffbe...0xffc9 => @fromBackingInt(@intCast(@backingInt(ctx_mod.Key.f1) + (keyval - 0xffbe))),
         else => null,
     };
 }

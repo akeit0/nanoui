@@ -33,6 +33,11 @@
   <img src="docs/images/nanomon-window.png" alt="nanomon, built on nanoui: the overview in Codegraff Light, with cell graphs of CPU, memory, GPU, disk and network" width="760">
 </p>
 
+This is a Windows-focused fork of [justrach/nanoui](https://github.com/justrach/nanoui).
+The first changes accelerate the CPU renderer with opaque span fills and a
+bounded shadow cache, and bring the headless benchmarks to Windows and Linux.
+macOS and Linux remain supported. Upstream attribution and licenses are preserved.
+
 Each window shows one of two kinds of interface:
 
 - **Native UI**, written in Zig alone and drawn by nanoui: no HTML, no
@@ -48,7 +53,7 @@ Apps are single binaries. Nothing polls, so an idle app uses no CPU.
 ## Get started
 
 ```sh
-git clone --recursive https://github.com/justrach/nanoui
+git clone --recursive https://github.com/akeit0/nanoui
 cd nanoui
 zig build run-gallery    # the native UI tour
 zig build run-hello      # the webview example
@@ -57,6 +62,21 @@ zig build test           # unit and widget tests
 
 You need Zig 0.17.0, plus the macOS SDK on a Mac (Xcode or the Command Line
 Tools). Linux apps need GTK 3 at run time and nothing at build time.
+
+On Windows, use an optimized build when judging animation performance:
+
+```powershell
+zig build run-gallery -Doptimize=ReleaseFast
+zig build test -j1
+cd hillclimb
+zig build run -j1 -- --label "windows" --scale 1.5
+```
+
+The default build is Debug. Windows draws native UI on the CPU and presents
+it with GDI; higher display scales increase the pixel workload. Stable shadow
+coverage is cached per window, up to 16 MiB, while moving or oversized shadows
+fall back to uncached rendering. The cache preserves Gaussian shadows and
+does no background work. See [Windows measurements](hillclimb/notes/windows-cpu.md).
 
 `--recursive` also fetches the apps, which live in their own repositories as
 submodules under `apps/`. To fetch them after a plain clone, run
@@ -216,6 +236,11 @@ your changes, use `--fork`: `cd apps/nanomon && zig build run --fork=../..`.
 ## Performance
 
 Performance is measured headless with [`hillclimb/`](hillclimb/README.md):
+Windows and Linux measure complete CPU-rendered frames, including offscreen
+buffer allocation, separately from the macOS Metal results below. These are
+rendering costs, not measurements of live window presentation or refresh rate.
+
+The upstream macOS measurements use
 the same scenes rendered through each framework's own frames and offscreen
 Metal renderer, on an Apple M3 Ultra. The figures are medians per frame in
 milliseconds; lower is better.

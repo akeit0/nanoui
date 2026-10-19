@@ -6,6 +6,8 @@
 const std = @import("std");
 const types = @import("types.zig");
 const gpu = @import("gpu.zig");
+const shadow_cache = @import("raster_cache.zig");
+pub const Cache = shadow_cache.Cache;
 
 /// The glyph atlas, as the shader samples it: one byte per texel.
 pub const Mask = struct {
@@ -22,10 +24,20 @@ pub const Pictures = struct {
 /// Draws `instances` over `clear` into `out` (sized `out.width` ×
 /// `out.height` pixels, `scale` pixels a point).
 pub fn draw(out: gpu.Pixels, instances: []const gpu.Instance, mask: Mask, pictures: Pictures, scale: f32, clear: types.Color) void {
+    drawImpl(out, instances, mask, pictures, scale, clear, null);
+}
+
+/// Like `draw`, reusing coverage of stable shadows in a bounded cache.
+pub fn drawCached(out: gpu.Pixels, instances: []const gpu.Instance, mask: Mask, pictures: Pictures, scale: f32, clear: types.Color, cache: *Cache) void {
+    cache.beginFrame();
+    drawImpl(out, instances, mask, pictures, scale, clear, cache);
+}
+
+fn drawImpl(out: gpu.Pixels, instances: []const gpu.Instance, mask: Mask, pictures: Pictures, scale: f32, clear: types.Color, cache: ?*Cache) void {
     const px: [4]u8 = .{ unit(clear.b), unit(clear.g), unit(clear.r), 255 };
     const words: []u32 = @alignCast(std.mem.bytesAsSlice(u32, out.bytes[0 .. out.width * out.height * 4]));
     @memset(words, @bitCast(px));
-    for (instances) |*i| drawOne(out, i, mask, pictures, scale);
+    for (instances) |*i| drawOne(out, i, mask, pictures, scale, cache);
 }
 
 fn unit(v: f32) u8 {
@@ -52,12 +64,12 @@ fn bounds(out: gpu.Pixels, i: *const gpu.Instance, scale: f32) ?[4]usize {
     return .{ @intFromFloat(px0), @intFromFloat(py0), @intFromFloat(px1), @intFromFloat(py1) };
 }
 
-fn drawOne(out: gpu.Pixels, i: *const gpu.Instance, mask: Mask, pictures: Pictures, scale: f32) void {
+fn drawOne(out: gpu.Pixels, i: *const gpu.Instance, mask: Mask, pictures: Pictures, scale: f32, cache: ?*Cache) void {
     const b = bounds(out, i, scale) orelse return;
     if (i.kind == gpu.Kind.text) return glyph(out, i, mask, scale, b);
     if (i.kind == gpu.Kind.image) return picture(out, i, pictures, scale, b);
-    if (i.kind == gpu.Kind.shadow) return shadow(out, i, scale, b);
-    quad(out, i, scale, b);
+    if (i.kind == gpu.Kind.shadow) return shadow(out, i, scale, b, cache);
+    quad(out, i, scale, b, true);
 }
 
 /// Blends a premultiplied color over the pixel at byte `at`.
@@ -110,7 +122,7 @@ inline fn clipCover(i: *const gpu.Instance, wx: f32, wy: f32, inv: f32) f32 {
     return 1 - smoothstep(-aa, aa, sd[0]);
 }
 
-fn quad(out: gpu.Pixels, i: *const gpu.Instance, scale: f32, b: [4]usize) void {
+fn quad(out: gpu.Pixels, i: *const gpu.Instance, scale: f32, b: [4]usize, comptime fast: bool) void {
     const hw = i.rect[2] * 0.5;
     const hh = i.rect[3] * 0.5;
     const cx = i.rect[0] + hw;
@@ -123,12 +135,28 @@ fn quad(out: gpu.Pixels, i: *const gpu.Instance, scale: f32, b: [4]usize) void {
     // Inside this, a pixel is wholly the fill: no edge, corner or border.
     const solid = @max(r, if (has_border) bw else 0) + 2 / scale;
     const inv = 1 / scale;
+    // Opaque interiors overwrite their destination. Fill a conservative
+    // span at once, leaving all edges, borders and rounded clips to the
+    // scalar path. The extra pixel keeps fractional DPI edges outside it.
+    const solid_fill = fast and c[3] == 1 and i.clip_round <= 0;
+    const width: f32 = @floatFromInt(out.width);
+    const left = @max(b[0], @as(usize, @intFromFloat(std.math.clamp(@ceil((cx - hw + solid) * scale + 1), 0, width))));
+    const right = @min(b[2], @as(usize, @intFromFloat(std.math.clamp(@floor((cx + hw - solid) * scale - 1), 0, width))));
+    var fill: [4]u8 = @splat(0);
+    if (solid_fill) blend(&fill, 0, c[0], c[1], c[2], 1);
     for (b[1]..b[3]) |y| {
         const wy = (@as(f32, @floatFromInt(y)) + 0.5) * inv;
         const py = wy - cy;
         const row = y * out.width * 4;
         const inner_y = @abs(py) < hh - solid;
-        for (b[0]..b[2]) |x| {
+        var x = b[0];
+        while (x < b[2]) : (x += 1) {
+            if (solid_fill and inner_y and x == left and right > left) {
+                const words: []u32 = @alignCast(std.mem.bytesAsSlice(u32, out.bytes[row + left * 4 .. row + right * 4]));
+                @memset(words, @as(u32, @bitCast(fill)));
+                x = right - 1;
+                continue;
+            }
             const wx = (@as(f32, @floatFromInt(x)) + 0.5) * inv;
             const pxl = wx - cx;
             const cut = clipCover(i, wx, wy, inv);
@@ -278,7 +306,43 @@ fn shadowAlpha(px: f32, py: f32, hw: f32, hh: f32, corner: f32, sigma: f32) f32 
     return alpha;
 }
 
-fn shadow(out: gpu.Pixels, i: *const gpu.Instance, scale: f32, b: [4]usize) void {
+/// A Gaussian shadow's four integration samples depend on the row, not
+/// the column. Keep their square roots and exponentials out of the pixel
+/// loop, preserving the scalar formula's order of floating point work.
+const ShadowRow = struct {
+    curved: [4]f32,
+    gaussian: [4]f32,
+    step: f32,
+    k: f32,
+
+    fn init(py: f32, hw: f32, hh: f32, corner: f32, sigma: f32) ShadowRow {
+        const start = std.math.clamp(-3 * sigma, py - hh, py + hh);
+        const end = std.math.clamp(3 * sigma, py - hh, py + hh);
+        var row: ShadowRow = .{ .curved = undefined, .gaussian = undefined, .step = (end - start) / 4, .k = @sqrt(@as(f32, 0.5)) / sigma };
+        var y = start + row.step * 0.5;
+        for (0..4) |j| {
+            const delta = @min(hh - corner - @abs(py - y), 0);
+            row.curved[j] = hw - corner + @sqrt(@max(0, corner * corner - delta * delta));
+            row.gaussian[j] = @exp(-(y * y) / (2 * sigma * sigma)) / (@sqrt(2 * std.math.pi) * sigma);
+            y += row.step;
+        }
+        return row;
+    }
+
+    fn alpha(row: ShadowRow, px: f32) f32 {
+        var a: f32 = 0;
+        for (0..4) |j| {
+            const lo = 0.5 + 0.5 * erf((px - row.curved[j]) * row.k);
+            const hi = 0.5 + 0.5 * erf((px + row.curved[j]) * row.k);
+            a += (hi - lo) * row.gaussian[j] * row.step;
+        }
+        return a;
+    }
+};
+
+fn shadow(out: gpu.Pixels, i: *const gpu.Instance, scale: f32, b: [4]usize, cache: ?*Cache) void {
+    const access = if (cache) |c| c.acquire(.init(i, scale, b)) else shadow_cache.Access.uncached;
+    if (access == .hit) return cachedShadow(out, i, scale, b, access.hit);
     const hw = i.rect[2] * 0.5;
     const hh = i.rect[3] * 0.5;
     const cx = i.rect[0] + hw;
@@ -291,11 +355,79 @@ fn shadow(out: gpu.Pixels, i: *const gpu.Instance, scale: f32, b: [4]usize) void
         const wy = (@as(f32, @floatFromInt(y)) + 0.5) * inv;
         const py = wy - cy;
         const row = y * out.width * 4;
+        const samples = ShadowRow.init(py, hw, hh, r, sigma);
         for (b[0]..b[2]) |x| {
             const wx = (@as(f32, @floatFromInt(x)) + 0.5) * inv;
             const pxl = wx - cx;
-            const a = shadowAlpha(pxl, py, hw, hh, r, sigma) * c[3] * clipCover(i, wx, wy, inv);
+            const coverage = samples.alpha(pxl);
+            if (access == .fill) access.fill[(y - b[1]) * (b[2] - b[0]) + x - b[0]] = coverage;
+            const a = coverage * c[3] * clipCover(i, wx, wy, inv);
             blend(out.bytes, row + x * 4, c[0] * a, c[1] * a, c[2] * a, a);
+        }
+    }
+}
+
+fn cachedShadow(out: gpu.Pixels, i: *const gpu.Instance, scale: f32, b: [4]usize, coverage: []const f32) void {
+    const inv = 1 / scale;
+    const c = i.color;
+    for (b[1]..b[3]) |y| {
+        const wy = (@as(f32, @floatFromInt(y)) + 0.5) * inv;
+        for (b[0]..b[2]) |x| {
+            const wx = (@as(f32, @floatFromInt(x)) + 0.5) * inv;
+            const a = coverage[(y - b[1]) * (b[2] - b[0]) + x - b[0]] * c[3] * clipCover(i, wx, wy, inv);
+            blend(out.bytes, (y * out.width + x) * 4, c[0] * a, c[1] * a, c[2] * a, a);
+        }
+    }
+}
+
+test "shadow rows match the scalar Gaussian at fractional DPI" {
+    for ([_]f32{ 0.75, 1, 1.25, 1.5, 2, 3 }) |scale| {
+        for ([_][4]f32{ .{ 20, 12, 0, 0.25 }, .{ 18.25, 9.5, 9.5, 3 }, .{ 140, 25, 12, 16 }, .{ 3, 2, 2, 20 } }) |shape| {
+            for (0..80) |y| {
+                const py = (@as(f32, @floatFromInt(y)) - 40.25) / scale;
+                const row = ShadowRow.init(py, shape[0], shape[1], shape[2], shape[3]);
+                for (0..100) |x| {
+                    const px = (@as(f32, @floatFromInt(x)) - 50.75) / scale;
+                    const expected = shadowAlpha(px, py, shape[0], shape[1], shape[2], shape[3]);
+                    try std.testing.expectEqual(expected, row.alpha(px));
+                }
+            }
+        }
+    }
+}
+
+test "opaque spans match scalar pixels with borders, clipping and fractional DPI" {
+    const gpa = std.testing.allocator;
+    const size = 100 * 80 * 4;
+    const expected = try gpa.alloc(u8, size);
+    defer gpa.free(expected);
+    const actual = try gpa.alloc(u8, size);
+    defer gpa.free(actual);
+    for ([_]f32{ 0.75, 1, 1.25, 1.5, 2, 3 }) |scale| {
+        for ([_]f32{ 0, 1.5, 8 }) |radius| {
+            for ([_]f32{ 0, 2, 12 }) |border| {
+                for ([_]f32{ 0.3, 1 }) |alpha| {
+                    for ([_]f32{ 0, gpu.clipRound(9, 15) }) |clip_round| {
+                        const i: gpu.Instance = .{
+                            .rect = .{ -2.25, 3.5, 70.75, 50.25 },
+                            .color = .{ 0.3, 0.6, 0.8, alpha },
+                            .radius = radius,
+                            .border_width = border,
+                            .border_color = .{ 0.9, 0.4, 0.1, 0.5 },
+                            .clip = .{ 5.25, 6.75, 90, 65 },
+                            .clip_round = clip_round,
+                        };
+                        const a: gpu.Pixels = .{ .bytes = actual, .width = 100, .height = 80 };
+                        const e: gpu.Pixels = .{ .bytes = expected, .width = 100, .height = 80 };
+                        @memset(expected, 113);
+                        @memset(actual, 113);
+                        const b = bounds(a, &i, scale).?;
+                        quad(e, &i, scale, b, false);
+                        quad(a, &i, scale, b, true);
+                        try std.testing.expectEqualSlices(u8, expected, actual);
+                    }
+                }
+            }
         }
     }
 }

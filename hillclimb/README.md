@@ -2,8 +2,9 @@
 
 A terminal app, built on nanoui as a library, that measures nanoui against
 [mygo](https://github.com/egoist/mygo) **without opening a window**: each
-scene is built, laid out and painted frame after frame, then drawn by the
-GPU into an offscreen texture, as a window's frames would be.
+scene is built, laid out and painted frame after frame. On macOS the GPU
+draws into an offscreen texture; Windows and Linux use the CPU renderer,
+including the same bounded shadow cache their native windows use.
 
 ```sh
 cd hillclimb
@@ -12,7 +13,7 @@ zig build run -- --label "what changed"        # name the run in history.jsonl
 zig build run -- --scene text,list --only nanoui --frames 600 --repeat 5
 ```
 
-Each scene runs 30 frames of warm-up, then 300 measured, three times; the
+On macOS, each scene runs 30 frames of warm-up, then 300 measured, three times; the
 run with the lowest median frame is kept. The table shows, per scene:
 
 | metric | what |
@@ -25,6 +26,27 @@ run with the lowest median frame is kept. The table shows, per scene:
 
 and compares nanoui with mygo (`n / m`), with nanoui's previous run (`Δ
 last`) and with its best (`Δ best`). Changes within ±5% are noise.
+
+## Windows and Linux
+
+```sh
+zig build run -j1 -- --label "baseline" --scale 1.5
+zig build run -j1 -- --scene dashboard,list --frames 300 --repeat 5 --scale 2
+```
+
+The CPU benchmark defaults to 10 warm-up frames, 100 measured frames and
+three repeats at 150% scale. The repeat with the lowest median **total**
+frame cost is kept. `total ms` and `p95 ms` include building the view,
+layout, paint, CPU rasterization, and allocating/freeing the framebuffer.
+`frame ms` measures build/layout/paint; `raster ms` includes the pixel buffer.
+Presentation through GDI or GTK and OS frame scheduling are not measured.
+
+`history-cpu.jsonl` keeps results separate from Metal history. Comparisons
+use the previous run matching OS, architecture, optimization mode, scale
+and measured frame count. Use the same machine and repeat count when comparing.
+The default benchmark build is ReleaseFast; use `-Doptimize=Debug` to inspect
+Debug performance. `--only nanoui` is accepted; mygo's Metal twin needs macOS.
+See [Windows measurements](notes/windows-cpu.md) for the first optimization pass.
 
 ## Scenes
 

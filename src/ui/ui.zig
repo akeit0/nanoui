@@ -110,6 +110,7 @@ test {
     if (!@import("text.zig").portable) _ = @import("shaper.zig");
     _ = @import("raster.zig");
     _ = @import("tests_raster.zig");
+    _ = @import("tests_raster_cache.zig");
     _ = @import("tt/raster.zig");
     _ = @import("tt/tests.zig");
     _ = @import("png.zig");

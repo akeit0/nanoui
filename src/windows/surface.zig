@@ -31,6 +31,7 @@ pub const Surface = struct {
     view: ui.View,
     instances: std.ArrayList(gpu.Instance) = .empty,
     pixels: []u8 = &.{},
+    raster_cache: raster.Cache,
     pixel_w: usize = 0,
     pixel_h: usize = 0,
     stale: bool = true,
@@ -50,12 +51,13 @@ pub const Surface = struct {
     pub fn create(window: *Window, view: ui.View, theme_override: ?Theme) !*Surface {
         const gpa = window.app.gpa;
         const self = try gpa.create(Surface);
-        self.* = .{ .gpa = gpa, .window = window, .text = .init(gpa), .ctx = undefined, .view = view, .theme_override = theme_override, .start_time = clock.now() };
+        self.* = .{ .gpa = gpa, .window = window, .text = .init(gpa), .ctx = undefined, .view = view, .raster_cache = .init(gpa), .theme_override = theme_override, .start_time = clock.now() };
         self.ctx = .init(gpa, &self.text);
         return self;
     }
 
     pub fn destroy(self: *Surface) void {
+        self.raster_cache.deinit();
         self.instances.deinit(self.gpa);
         self.gpa.free(self.pixels);
         self.ctx.deinit();
@@ -110,7 +112,7 @@ pub const Surface = struct {
             self.pixel_w = pw;
             self.pixel_h = ph;
         }
-        raster.draw(.{ .bytes = self.pixels, .width = pw, .height = ph }, self.instances.items, self.text.atlas.mask(), self.text.images.pictures(), self.scale, self.ctx.theme.background);
+        raster.drawCached(.{ .bytes = self.pixels, .width = pw, .height = ph }, self.instances.items, self.text.atlas.mask(), self.text.images.pictures(), self.scale, self.ctx.theme.background, &self.raster_cache);
         self.stale = false;
     }
 
@@ -271,7 +273,7 @@ pub const Surface = struct {
             0x1B => .escape,
             0x21 => .page_up,
             0x22 => .page_down,
-            0x70...0x7B => @enumFromInt(@intFromEnum(ctx_mod.Key.f1) + (vk - 0x70)),
+            0x70...0x7B => @fromBackingInt(@intCast(@backingInt(ctx_mod.Key.f1) + (vk - 0x70))),
             else => null,
         };
         const S = ui.Shortcut;

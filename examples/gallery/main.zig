@@ -1,5 +1,5 @@
 //! A tour of the native UI toolkit: layout, text, and every widget, drawn
-//! by nanoui with Metal.
+//! by nanoui with each platform's renderer.
 const std = @import("std");
 const nanoui = @import("nanoui");
 const ui = nanoui.ui;
@@ -56,7 +56,11 @@ const Gallery = struct {
         });
         defer ui.end(c);
         ui.text(c, "nanoui", .{ .size = 18, .weight = .bold });
-        ui.label(c, "Zig 0.17 · Metal");
+        ui.label(c, switch (@import("builtin").os.tag) {
+            .windows => "Zig 0.17 · Windows",
+            .linux => "Zig 0.17 · Linux",
+            else => "Zig 0.17 · Metal",
+        });
         _ = c.leaf(.{ .height = .{ .px = 12 } }, .none, null);
         const pages = [_][2][]const u8{
             .{ "Controls", "slider.horizontal.3" },

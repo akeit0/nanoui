@@ -46,6 +46,7 @@ pub const Tester = struct {
     scale: f32,
     theme: Theme,
     instances: std.ArrayList(gpu.Instance) = .empty,
+    raster_cache: raster.Cache,
     /// Seconds each frame advances animations by.
     dt: f32 = 1.0 / 60.0,
     /// What copy and cut wrote: tests never touch the system's clipboard.
@@ -60,6 +61,7 @@ pub const Tester = struct {
         errdefer if (!portable) renderer.deinit();
         t.* = .{
             .gpa = gpa,
+            .raster_cache = .init(gpa),
             .renderer = renderer,
             .text = if (portable) .init(gpa) else .init(gpa, renderer.device),
             .ctx = undefined,
@@ -81,6 +83,7 @@ pub const Tester = struct {
     }
 
     pub fn deinit(t: *Tester) void {
+        t.raster_cache.deinit();
         t.clipboard.deinit(t.gpa);
         t.instances.deinit(t.gpa);
         t.ctx.deinit();
@@ -233,7 +236,7 @@ pub const Tester = struct {
         const w: usize = @intFromFloat(@max(1, @round(t.size.w * t.scale)));
         const h: usize = @intFromFloat(@max(1, @round(t.size.h * t.scale)));
         const out: gpu.Pixels = .{ .bytes = try gpa.alloc(u8, w * h * 4), .width = w, .height = h };
-        raster.draw(out, t.instances.items, t.text.atlas.mask(), t.text.images.pictures(), t.scale, t.theme.background);
+        raster.drawCached(out, t.instances.items, t.text.atlas.mask(), t.text.images.pictures(), t.scale, t.theme.background, &t.raster_cache);
         return out;
     }
 
