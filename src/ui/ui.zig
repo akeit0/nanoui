@@ -113,6 +113,7 @@ test {
     _ = @import("tests_raster_cache.zig");
     _ = @import("tt/raster.zig");
     _ = @import("tt/tests.zig");
+    _ = @import("tt/fontdb_tests.zig");
     _ = @import("png.zig");
     _ = @import("png_decode.zig");
     _ = @import("images.zig");

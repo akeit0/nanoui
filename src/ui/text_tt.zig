@@ -172,7 +172,7 @@ pub const TextSystem = struct {
         var h = std.hash.Wyhash.init(extra);
         h.update(s);
         h.update(std.mem.asBytes(&style.size));
-        h.update(&.{ @intFromEnum(style.weight), @intFromBool(style.mono), @intFromBool(style.italic) });
+        h.update(&.{ @backingInt(style.weight), @intFromBool(style.mono), @intFromBool(style.italic) });
         return h.final();
     }
 
@@ -222,7 +222,7 @@ pub const TextSystem = struct {
             var rf = primary;
             var g = rf.font.glyphIndex(if (cp == '\t') ' ' else cp);
             if (g == 0 and cp >= 0x20) {
-                if (self.db.fallback(cp, f.weight)) |face| {
+                if (self.db.fallback(cp, f.weight, style.italic)) |face| {
                     const fid = self.runFont(face, size, style.italic, f.weight);
                     if (fid != 0xffff) {
                         id = fid;

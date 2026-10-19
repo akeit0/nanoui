@@ -18,6 +18,15 @@ const Loaded = struct {
     font: font.Font,
 };
 
+const FallbackKey = struct { cp: u21, weight: u16, italic: bool };
+
+/// Match weight/style as GPUI's font matcher does. Family priority is
+/// handled separately, before comparing faces within the candidate set.
+fn styleScore(style: font.Style, weight: u16, italic: bool) u32 {
+    const dw: u32 = @abs(@as(i32, style.weight) - @as(i32, weight));
+    return dw + @as(u32, if (style.italic != italic) 1000 else 0);
+}
+
 /// Families tried when the theme names none (or one not installed).
 const sans = [_][]const u8{ "Inter", "Geist", "Segoe UI", "Noto Sans", "Cantarell", "Ubuntu", "DejaVu Sans", "Liberation Sans", "Arial", "Helvetica" };
 const monos = [_][]const u8{ "JetBrains Mono", "Geist Mono", "Cascadia Mono", "Consolas", "Noto Sans Mono", "DejaVu Sans Mono", "Ubuntu Mono", "Liberation Mono", "Menlo", "Courier New" };
@@ -38,8 +47,9 @@ pub const Db = struct {
     faces: std.ArrayList(Face) = .empty,
     loaded: std.AutoHashMapUnmanaged(u32, *Loaded) = .empty,
     scanned: bool = false,
-    /// Characters' fallback faces, found once (null: none has it).
-    found: std.AutoHashMapUnmanaged(u21, ?u32) = .empty,
+    /// Fallback preserves the requested weight/style, including in the
+    /// cache: finding a bold glyph must not change a later regular run.
+    found: std.AutoHashMapUnmanaged(FallbackKey, ?u32) = .empty,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io) Db {
         return .{ .gpa = gpa, .io = io };
@@ -119,6 +129,7 @@ pub const Db = struct {
             if (style.family_len == 0) continue;
             const owned = db.gpa.dupe(u8, path) catch return;
             db.faces.append(db.gpa, .{ .path = owned, .index = @intCast(i), .style = style }) catch db.gpa.free(owned);
+            db.found.clearRetainingCapacity();
         }
     }
 
@@ -130,8 +141,7 @@ pub const Db = struct {
         var best_score: u32 = std.math.maxInt(u32);
         for (db.faces.items, 0..) |f, i| {
             if (!std.ascii.eqlIgnoreCase(f.style.name(), name)) continue;
-            const dw: u32 = @abs(@as(i32, f.style.weight) - @as(i32, weight));
-            const score = dw + @as(u32, if (f.style.italic != italic) 1000 else 0);
+            const score = styleScore(f.style, weight, italic);
             if (score < best_score) {
                 best_score = score;
                 best = @intCast(i);
@@ -169,34 +179,49 @@ pub const Db = struct {
         return &l.font;
     }
 
-    /// A face that has `cp`, for text its font lacks.
-    pub fn fallback(db: *Db, cp: u21, weight: u16) ?u32 {
-        if (db.found.get(cp)) |f| return f;
-        const f = db.findFallback(cp, weight);
-        db.found.put(db.gpa, cp, f) catch {};
+    /// A face that has `cp`, retaining the original run's weight/style,
+    /// as mygo's text formats and GPUI's fallback attributes do.
+    pub fn fallback(db: *Db, cp: u21, weight: u16, italic: bool) ?u32 {
+        db.scan();
+        const key: FallbackKey = .{ .cp = cp, .weight = weight, .italic = italic };
+        if (db.found.get(key)) |f| return f;
+        const f = db.findFallback(cp, weight, italic) catch return null;
+        db.found.put(db.gpa, key, f) catch {};
         return f;
     }
 
-    fn findFallback(db: *Db, cp: u21, weight: u16) ?u32 {
-        for (fallbacks) |n| if (db.family(n, weight, false)) |face| {
+    fn findFallback(db: *Db, cp: u21, weight: u16, italic: bool) !?u32 {
+        for (fallbacks) |n| if (db.family(n, weight, italic)) |face| {
             if (db.load(face)) |f| if (f.glyphIndex(cp) != 0) return face;
         };
-        // Any face at all: the loaded first, then the rest.
-        var it = db.loaded.iterator();
-        while (it.next()) |e| if (e.value_ptr.*.font.glyphIndex(cp) != 0) return e.key_ptr.*;
-        // Read, checked and let go unless it has it; a few dozen at most.
-        var tries: usize = 0;
-        for (0..db.faces.items.len) |i| {
-            if (tries >= 48) break;
-            if (db.loaded.contains(@intCast(i))) continue;
-            if (i > 0 and std.mem.eql(u8, db.faces.items[i - 1].style.name(), db.faces.items[i].style.name())) continue;
-            tries += 1;
-            const face = db.faces.items[i];
-            const data = std.Io.Dir.cwd().readFileAlloc(db.io, face.path, db.gpa, .limited(256 << 20)) catch continue;
-            defer db.gpa.free(data);
-            const f = font.Font.init(data, face.index) catch continue;
-            if (f.glyphIndex(cp) != 0) return @intCast(i);
-        }
+        // System fallback: match attributes before testing coverage. A
+        // previously loaded face or a Bold file discovered first has no
+        // priority over a Regular face. Do not skip sibling faces or stop
+        // after 48 files: different weights can have different coverage.
+        const candidates = try db.gpa.alloc(u32, db.faces.items.len);
+        defer db.gpa.free(candidates);
+        for (candidates, 0..) |*candidate, i| candidate.* = @intCast(i);
+        const Order = struct {
+            db: *Db,
+            weight: u16,
+            italic: bool,
+            fn less(order: @This(), a: u32, b: u32) bool {
+                const sa = styleScore(order.db.faces.items[a].style, order.weight, order.italic);
+                const sb = styleScore(order.db.faces.items[b].style, order.weight, order.italic);
+                return if (sa == sb) a < b else sa < sb;
+            }
+        };
+        std.mem.sort(u32, candidates, Order{ .db = db, .weight = weight, .italic = italic }, Order.less);
+        for (candidates) |face| if (db.covers(face, cp)) return face;
         return null;
+    }
+
+    fn covers(db: *Db, face: u32, cp: u21) bool {
+        if (db.loaded.get(face)) |loaded| return loaded.font.glyphIndex(cp) != 0;
+        const entry = db.faces.items[face];
+        const data = std.Io.Dir.cwd().readFileAlloc(db.io, entry.path, db.gpa, .limited(256 << 20)) catch return false;
+        defer db.gpa.free(data);
+        const parsed = font.Font.init(data, entry.index) catch return false;
+        return parsed.glyphIndex(cp) != 0;
     }
 };
